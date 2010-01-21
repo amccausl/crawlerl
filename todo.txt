@@ -1,0 +1,5 @@
+* write conf file parser
+* copy dispatcher logic to router
+* add siteconfig to store info for downloaders (name, # threads)
+* write html parsing logic (with callbacks)
+* determine how to pass filenames back up the tree (result of async router call 
