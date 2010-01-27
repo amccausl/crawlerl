@@ -1,5 +1,21 @@
 * write conf file parser
+ * url rewrite (new url), crawl (filename, depth, filter (function to filter urls), threads), download (filename, threads) options
+ * router( url, path [parent urls], parent PID )
 * copy dispatcher logic to router
-* add siteconfig to store info for downloaders (name, # threads)
 * write html parsing logic (with callbacks)
-* determine how to pass filenames back up the tree (result of async router call 
+ * full parsing not necessary, link extraction is enough
+ * parse( parent PID, router PID, index, remaining text, filter url function )
+* determine how to pass filenames back up the tree (result of async router call)
+ * pass to parent id with index
+ * if crawler thread, wait until all children have returned, pass back ordered urls to parent with index
+* include url rewriting logic to get absolute urls
+* write index file logic
+
+rule_processor => "url" => rule_router => rule_manager => rule_processor
+
+rule_router( Url, ParentPID, Index, [{depth, N}] )
+* stores list of Rules
+* receives messages from rule_processor (Url, ParentPID, ParentURL, Index, [{depth, N}] )
+rule_manager( Url, ParentPID, Index, [{depth, N}] )
+* stores compiled rule locally
+rule_processor( Rule, Url, ParentPID, Index, [{depth, N}] )

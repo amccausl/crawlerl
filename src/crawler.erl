@@ -2,15 +2,15 @@
 %%% @doc 
 %%% This is a learning excerize in the language.
 %%%
-%%% start() -> Parse parameters from command line, call init, run router
-%%% init() -> configure http client, load config, start router (register(router, Router))
-%%% router() -> Store rules for downloader
+%%% start() -> Parse parameters from command line, call init, run dispatcher
+%%% init() -> configure http client, load config, start dispatcher (register(dispatcher, Dispatcher))
+%%% dispatcher() -> Store rules for downloader
 %%%  rule must include callbacks, save location (or undef), number of threads
 %%%  use register(Name, PID) and whereis(Name) to find actor for each rule
 %%% rule_actor(Rule) -> knows action to take for file, spawns threads to take action,
-%%%  possible actions: save(fun filename) save url to disk, crawl([Tags]) takes array of tags to call router for
+%%%  possible actions: save(fun filename) save url to disk, crawl([Tags]) takes array of tags to call dispatcher for
 %%%  creates number of threads
-%%%  accepts messages from threads ('DOWN', Ref, process, Pid2, Reason), and from router (url, URL)
+%%%  accepts messages from threads ('DOWN', Ref, process, Pid2, Reason), and from dispatcher (url, URL)
 %%% downloader 
 %%% crawler
 %%% @end
@@ -24,34 +24,48 @@
 %get_filename( {URL, Headers} ) ->
 
 -module( crawler ).
--export( [ start/0, start/1, get_page/1 ] ).
+-export( [ start/0, start/1, get_page/1, dispatcher_init/1 ] ).
 -include_lib("xmerl/include/xmerl.hrl").
 
 % start with url on cmd line, maybe some preprocessing
 start() ->
   init(),
-  {ok, [URLs]} = init:get_arguments( url ),
-  RouterPID = spawn( crawler, router, [] );
-start_test(URL) ->
+  {ok, URLs} = init:get_arguments( url ),
+  register(crawler_dispatcher, spawn( crawler, dispatcher_init, URLs )).
+
+start(URL) ->
   init(),
-  RouterPID = spawn( crawler, router, [] ).
+  register(crawler_dispatcher, spawn( crawler, dispatcher_init, [URL] )).
 
 init() ->
-  inets:start().
+  inets:start(),
+  crawler_config:load(),
   % configure http client
-  % load config
   % create processes for each parser
 
-router() ->
+dispatcher([URL|Rest]) ->
+  self() ! { url, URL },
+  dispatcher_init(Rest);
+dispatcher([]) ->
+  dispatcher_re().
+
+dispatcher_re() ->
   receive
     { url, URL } ->
-    %{ img, IMG } ->
+      process(URL),
+      dispatcher_re()
+  end.
+
+process(URL) ->
+  % pass to rule_manager (parent PID, ChildArray, Threads)
+  crawler_dispatcher ! {url, URL}. 
+
+rule_manager({crawl, Name, Pattern, Args}) ->
   end.
 
 rule_actor(Rule, NumThreads) ->
   receive
     { url, URL } ->
-	  
   end.
 
 receiver(Rule, Queue, Threads) ->
@@ -61,15 +75,14 @@ receiver(Rule, Queue, Threads) ->
       downloader(Rule, URL),
       receiver(Rule, Queue, Threads - 1);
     {'DOWN', Ref, process, Pid, Reason} ->
-	  receiver( Rule, Threads + 1 )
+	  receiver( Rule, Queue, Threads + 1 )
   end.
 
-%downloader(Rule, URL) ->
-%crawler(Rule, URL) ->
+downloader(Rule, URL) ->
+  io:format("blah~n").
 
 get_page(URL) ->
   process_page( http:request(URL) ).
 
 process_page( { ok, {_Status, _Headers, Body }} ) -> lists:subtract(lists:subtract(Body, "// [ "), "] ");
 process_page( {error,no_scheme} ) -> io:format( "No scheme error" ).
-
