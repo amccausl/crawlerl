@@ -4,7 +4,7 @@
 % entries should include: action, url regex, thread count
 
 load() ->
-  ConfFile = filename:join(["..", "config", "crawler_dispatcher.conf"]),
+  ConfFile = filename:join(["..", "config", "crawler_rules.conf"]),
   {ok, Rules} = file:consult(ConfFile),
   {ok, NamedRegexp} = re:compile("\\?\\<[A-Za-z_0-9]+\\>", [ungreedy]),
 

@@ -1,144 +1,132 @@
 %%% @author Alex McCausland <alex.mccausland@gmail.com>
-%%% @doc 
-%%% This is a learning excerize in the language.
-%%%
-%%% start() -> Parse parameters from command line, call init, run dispatcher
-%%% init() -> configure http client, load config, start dispatcher (register(dispatcher, Dispatcher))
-%%% dispatcher() -> Store rules for downloader
-%%%  rule must include callbacks, save location (or undef), number of threads
-%%%  use register(Name, PID) and whereis(Name) to find actor for each rule
-%%% rule_actor(Rule) -> knows action to take for file, spawns threads to take action,
-%%%  possible actions: save(fun filename) save url to disk, crawl([Tags]) takes array of tags to call dispatcher for
-%%%  creates number of threads
-%%%  accepts messages from threads ('DOWN', Ref, process, Pid2, Reason), and from dispatcher (url, URL)
-%%% downloader 
-%%% crawler
-%%% @end
 
-% main actor to hit param url, download threads
-
-% as thread is parsed, spawn or pass messages as needed to download contents
-
-% each parser should register with the name from the config
-
-%get_filename( {URL, Headers} ) ->
+% TODO: finish and test config loader and matcher
+% TODO: spawn manager threads for each rule
+% TODO: router should prepend ID information
+% TODO: write tests for rewrite functionality
+% TODO: finish load and config functionality
+% TODO: sketch out rule_crawl
+% TODO: sketch out rule_save
+% TODO: add index file handling
+% TODO: should store each processed url in each thread
+% TODO: on launch, should check process cache, then translated filename (if local) to determine if fetch has already occured
+% TODO: figure out EUnit
+% TODO: add in cycling detection for crawlers (examine id for occurrences of the same rule, if exists, spawn thread to resolve)
 
 -module( crawler ).
--export( [ start/0, start/1, get_page/1, dispatcher_init/1 ] ).
+-export( [ start/0, router/1, rule_actor/2 ] ).
 
 % start with url on cmd line, maybe some preprocessing
 start() ->
-  init(),
-  {ok, URLs} = init:get_arguments( url ),
-  register(crawler_dispatcher, spawn( crawler, dispatcher_init, URLs )).
+	init(),
+	{ok, URLs} = init:get_arguments( url ),
+	Rules = crawler_config:load_rules(),
+	PID = spawn( crawler, router, Rules ),
+	register(router, PID),
+	route(PID, URLs).
 
-start(URL) ->
-  init(),
-  register(crawler_dispatcher, spawn( crawler, dispatcher_init, [URL] )).
+route( _, [] ) ->
+	{ok};
+route( PID, [Url|Urls] ) ->
+	PID ! {url, Url},
+	route( PID, Urls ).
 
 init() ->
-  inets:start(),
-  crawler_config:load(),
+  inets:start().
   % configure http client
-  % create processes for each parser
 
-dispatcher([URL|Rest]) ->
-  self() ! { url, URL },
-  dispatcher_init(Rest);
-dispatcher([]) ->
-  dispatcher_re().
-
-dispatcher_re() ->
-  receive
-    { url, URL } ->
-      process(URL),
-      dispatcher_re()
-  end.
-
-process(URL) ->
-  % pass to rule_manager (parent PID, ChildArray, Threads)
-  crawler_dispatcher ! {url, URL}. 
-
-rule_manager({crawl, Name, Pattern, Args}) ->
-  end.
-
-rule_actor(Rule, NumThreads) ->
-  receive
-    { url, URL } ->
-  end.
-
-receiver(Rule, Queue, Threads) ->
-  % if threads > 0, queue not empty, process from queue
-  receive
-    { url, URL } ->
-      downloader(Rule, URL),
-      receiver(Rule, Queue, Threads - 1);
-    {'DOWN', Ref, process, Pid, Reason} ->
-	  receiver( Rule, Queue, Threads + 1 )
-  end.
-
-downloader(Rule, URL) ->
-  io:format("blah~n").
-
-get_page(URL) ->
-  process_page( http:request(URL) ).
-
-process_page( { ok, {_Status, _Headers, Body }} ) -> lists:subtract(lists:subtract(Body, "// [ "), "] ");
-process_page( {error,no_scheme} ) -> io:format( "No scheme error" ).
-
-crawl( ParentID, RuleID, Url ) ->
-  {ok, {_Status, _Headers, HTML}} = http:request(Url),
-  RelativeUrls = parse_url( HTML, [] ),
-  Urls = lists:map(fun(X) -> url_makeAbsolute(X) end, RelativeUrls), 
-  crawl_re(ParentID, Urls, Threads, 1).
-
-crawl_re( ParentID, [], Threads, ThreadCount, Index ) ->
+router(Rules) ->
 	receive
-		{callback, PID, Index, Url, Filename} ->
-			crawl_re( ParentID, [],  )lists;
-    	{'DOWN', Ref, process, Pid, Reason} ->	
-	end;
-crawl_re( ParentID, [Url|Urls], Threads, ThreadCount, Index ) when ThreadCount > 0 ->
-	NewThread = { spawn( crawler, )},
-	crawl_re( ParentID, Urls, [NewThread|Threads], ThreadCount - 1, Index + 1 ).
-
-% Final
-
-rule_crawl(Rule, [], Threads, ThreadCount) ->
-	receive
-		{callback, Pid, Index, Url} ->
-rule_crawl(Rule, Queue, Threads, ThreadCount) when ThreadCount > 0 ->
-	.
-
-rule_save(Rule, [], Threads, ThreadCount) when ThreadCount > 0 ->
-	receive
-		{url, Request} ->
-	end;
-rule_save(Rule, Queue, Threads, ThreadCount) ->
-	receive
-		{url, Request} -> rule_save( Rule, [Request|Queue], Threads, ThreadCount);
-		{callback, Pid, Index, }
-	end;
-rule_save(Rule, Queue, Threads, ThreadCount) when ThreadCount > 0 ->
-	receive
+		{url, Url} ->
+			case find_rule( Rules, Url ) of
+				{undef} ->
+					io:format("No rule for url: ~s/n", [Url]),
+					router(Rules);
+				{Type, Name, Params} ->
+					io:format("Matched '~s' to rule '~s'", [Url, Name]),
+					router(Rules)
+			end;
+		{request, Request} ->
+			io:format("blah"),
+			router(Rules)
 	end.
 
-save_thread(Url, Filename) ->
-	.
-
-rule_rewrite(Rule) ->
+rule_manager( Rule, [Request|Queue], Threads, ThreadCount) when ThreadCount > 0 ->
+	PID = spawn( crawler, rule_actor, [Rule, Request] ),
+	erlang:monitor(process, PID),
+	rule_manager( Rule, Queue, [{PID, Request}|Threads], ThreadCount - 1 );
+rule_manager( Rule, Queue, Threads, ThreadCount) ->
 	receive
-		{url, Request} ->
+		{request, Request} ->
+			rule_manager( Rule, [Request|Queue], Threads, ThreadCount);
+		{'DOWN', _, process, Pid, Reason} ->
+			% pass message to parent, Reason = {Id, [Filenames]}
+			rule_manager( Rule, Queue, lists:keydelete(Pid, 1, Threads), ThreadCount + 1 )
 	end.
 
-rewrite(Url, []) -> {ok}. 
-rewrite(Url, [Translation|Rest]) ->
-	
+%% Rule		= {crawl, Name, Translation}
+%% Rule		= {save, Name, Translation}
+%% Rule		= {rewrite, Name, Translation}
+%% Request	= Id
+%% Id		= [{RuleName, PID, Index, Url}] - A Unique id for every request, a heirarchy of rule ids and urls (should be useful for cycling)
+%% Response = {Url, Filename}
+%%			= {Url, Responses}
+rule_actor( {crawl, Name, Translation}, [{Rulename, PID, Index, Url}|Rest] ) ->
+	Request		 = [{Rulename, PID, Index, Url}|Rest],
+	Filename	 = trans_run( Url, Translation ),
+	Body		 = get_page(Url),
+	RelativeUrls = parse_url(Body, []),
+	Urls		 = lists:map(fun(X) -> url_makeAbsolute(Url, X) end, RelativeUrls),
+	rule_crawl(Urls, Request, [], 0);
+rule_actor( {save, Name, Translation}, [{Rulename, PID, Index, Url}|Request] ) ->
+	Filename = trans_run( Url, Translation ),
+	{ok, Status, Headers, Body} = ibrowse:send_req(Url, [], get),
+	file:write_file(Filename, Body),
+	{Url, Filename};
+rule_actor( {rewrite, Name, Translations}, Request ) ->
+	rule_rewrite( Translations, Request, [], 0 ).
 
-get_rule_process(Url) ->
-	.
+rule_crawl([], Request, Responses, 0) ->
+%% All urls have been crawled
+	{ok, Request, Responses};
+rule_crawl([], Request, Responses, Index) ->
+%% All urls have been dispatched, awaiting results
+	receive
+		{callback, [{_, _, Url}|_], Result} ->
+			NewResponses = lists:keyreplace(Url, 1, Responses, Result),
+			rule_crawl( [], Request, NewResponses, Index - 1 )
+	end;
+rule_crawl([Url|Urls], Request, Responses, Index) ->
+%% Generate requests for each of the Urls
+	[{Name, _, _, _}|_] = Request,
+	NewId	= [{Name, erlang:self(), Url}],
+	router ! { NewId },
+	rule_crawl( Urls, Request, [{Url}|Responses], Index + 1).
+
+% Rules to rewrite urls by patters
+rule_rewrite( [], Request, Responses, 0 ) ->
+%% All rewrites have completed
+	{ callback, Request, Responses };
+rule_rewrite( [], Request, Responses, Index ) ->
+%% All rewrites have been generated, waiting for responses
+	receive
+		{callback, [{_, _, Url}|_], Result} ->
+			NewResponses = lists:keyreplace(Url, 1, Responses, Result),
+			rule_rewrite( [], Request, NewResponses, Index - 1)
+	end;
+rule_rewrite( [Translation|Translations], Request, Responses, Index ) ->
+%% Generate requests for each of the translations
+	[{Name, _, _, Url}|_] = Request,
+	NewUrl	= trans_run( Url, Translation ),
+	NewId	= [{Name, erlang:self(), NewUrl}|Request],
+	router ! { NewId },
+	rule_rewrite( Translations, Request, [{NewUrl}|Responses], Index + 1 ).
 
 % Crawl helpers
+get_page(URL) ->
+  process_page( http:request(URL) ).
+process_page( { ok, {_Status, _Headers, Body }} ) -> lists:subtract(lists:subtract(Body, "// [ "), "] ");
+process_page( {error,no_scheme} ) -> io:format( "No scheme error" ).
 parse_quoted(Input) ->
 	[Quote|Tail] = Input,
 	Quoted = lists:takewhile(fun(X) -> X =/= Quote end, Tail),
@@ -177,3 +165,9 @@ url_getDirectory( Url )	->
 			RUrl = lists:reverse(Base),
 			lists:reverse(lists:dropwhile(fun(X) -> X =/= 47 end, RUrl))
 	end.
+% Rule helpers
+trans_run(Input, {Regex, Atoms, Template}) ->
+  {match, Subpatterns} = re:run(Input, Regex, [global, {capture, Atoms, list}]),
+  sgte:render_str(Template, lists:zip(Atoms, Subpatterns)).
+find_rule( Rules, Url ) ->
+	{undef}.
