@@ -30,7 +30,6 @@
 % TODO: should store each processed url in each thread
 % TODO: on launch, should check process cache, then translated filename (if local) to determine if fetch has already occured
 % TODO: add caching in rule_manager
-% TODO: write response printer
 
 -module( crawler ).
 -export( [ start/0, stop/0, router/1, uri_parse/1, html_extract_urls/2, url_makeAbsolute/2 ] ).
@@ -44,7 +43,7 @@ start() ->
 	%route(router, URLs).
 
 stop() ->
-	router ! {exit}.
+	router ! {stop}.
 
 init() ->
 	{ok, Rules} = crawler_config:load_rules(),
@@ -73,7 +72,7 @@ router(RuleProcesses) ->
 			io:format("query router for status~n"),
 			lists:map(fun(X) -> PID = element(2, X), PID ! {status} end, RuleProcesses),
 			router( RuleProcesses );
-		{exit} ->
+		{stop} ->
 			lists:map(fun(X) -> element(2, X) ! {stop} end, RuleProcesses),
 			{ok}
 	end.
@@ -113,7 +112,7 @@ rule_manager( Rule, Queue, Threads, ThreadCount) ->
 			io:format("Rule: ~w~n~w~n", [Rule, Threads]),
 			rule_manager( Rule, Queue, Threads, ThreadCount );
 		{stop} ->
-			io:format("stopping rule_manager '~s:~w'~n", [element(2, Rule), erlang:self()]),
+			io:format("stopping rule_manager '~s:~w' ~B threads~n", [element(2, Rule), erlang:self(), ThreadCount]),
 			lists:map(fun(X) -> exit(element(1, X), kill) end, Threads)
 	end.
 
@@ -225,8 +224,19 @@ html_extract_urls( HTML, Urls ) ->
 
 -spec(url_makeAbsolute/2 :: (string(), string()) -> string()).
 url_makeAbsolute( {Protocol, Host, Path, Params}, Link ) ->
-	% TODO: add removal of "../" and "./" from urls
 	case hd(Link) of
+		46 ->
+			% Remove "./" and "../" from urls
+			{First, Second} = partition(47, Link),
+			case First of
+				".." ->
+					{_, NewPath} = partition(47, lists:reverse(Path)),
+					url_makeAbsolute( {Protocol, Host, lists:reverse(NewPath), Params}, Second );
+				"." ->
+					url_makeAbsolute( {Protocol, Host, Path, Params}, Second );
+				_ ->
+					Protocol ++ "://" ++ Host ++ filename:join(["/", Path, Link])
+			end;
 		47 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Link]); % '/'
 		63 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ Link; % '?'
 		35 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ "?" ++ Params; % '#'
@@ -258,6 +268,7 @@ partition(Delim, Str) ->
 % Rule helpers
 templates_run( Map, Templates ) ->
 	% Run a list of templates with the variable definitions to return a list of strings
+	io:format("Rendering templates with map: ~w~n", Map),
 	lists:map(fun(X) -> sgte:render_str(X, Map) end, Templates).
 find_rule( [], _ ) ->
 	nomatch;
@@ -270,12 +281,11 @@ find_rule( [{Translation, PID}|RuleProcesses], Url ) ->
 			find_rule( RuleProcesses, Url )
 	end.
 
-response_to_string(_) -> "". %response_to_string( Value, "", 0 ).
-%response_to_string({Url, []}, Acc, Depth) ->
-%	"";
-%response_to_string({Url, [{Url, Response}|Rest]}, Acc, Depth) ->
-%	"";
-%response_to_string({Url, [{Url, Response}|Rest]}, Acc, Depth) ->
-%	"";
-%response_to_string({Url, [Filename|Filenames]}, Acc, Depth) ->
-%	"".
+response_to_string(Value) ->
+	response_to_string( Value, 0 ).
+response_to_string( [], _ ) ->
+	"";
+response_to_string( [{Url, Response}|Rest], Depth ) ->
+	lists:duplicate(Depth, 32) ++ Url ++ "\n" ++ response_to_string( Response, Depth + 2 ) ++ response_to_string(Rest, Depth);
+response_to_string( [Filename|Rest], Depth ) ->
+	lists:duplicate(Depth, 32) ++ Filename ++ "\n" ++ response_to_string( Rest, Depth ).
