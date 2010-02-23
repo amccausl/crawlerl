@@ -9,11 +9,18 @@ ibrowse_test() ->
 	ibrowse:start(),
 	ibrowse:send_req("http://localhost", [], get).
 
-rule_actor_save_test() ->
+rule_actor_save_html_test() ->
 	Filename = filename:join(["..", "data", "save_test"]),
 	file:delete(Filename),
 	Rule = {save, save_test, [Filename]},
 	Request = {save_test, erlang:self(), "http://localhost"},
+	crawler:rule_actor( Rule, [Request] ).
+
+rule_actor_save_bin_test() ->
+	Filename = filename:join(["..", "data", "save_test2.png"]),
+	file:delete(Filename),
+	Rule = {save, save_test, [Filename]},
+	Request = {save_test, erlang:self(), "http://localhost/feh_006977_000001_w3mtmp6966-1.png"},
 	crawler:rule_actor( Rule, [Request] ).
 
 rule_actor_crawl_test() ->
@@ -37,3 +44,11 @@ uri_parse_test() ->
 
 rule_actor_rewrite_test() ->
 	"".
+
+router_test() ->
+	crawler:start(),
+	router ! {status},
+	router ! {request, {[{none, erlang:self(), none}], "http://google.ca"}},
+	receive
+		Msg -> io:format("router_test: ~w~n", [Msg])
+	end.
