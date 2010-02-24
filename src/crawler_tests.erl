@@ -48,7 +48,7 @@ rule_actor_rewrite_test() ->
 router_test() ->
 	crawler:start(),
 	router ! {status},
-	router ! {request, {[{none, erlang:self(), none}], "http://google.ca"}},
+	router ! {request, {[], "http://localhost"}},
 	receive
 		Msg -> io:format("router_test: ~w~n", [Msg])
 	end.

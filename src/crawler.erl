@@ -30,11 +30,14 @@
 % TODO: should store each processed url in each thread
 % TODO: on launch, should check process cache, then translated filename (if local) to determine if fetch has already occured
 % TODO: add caching in rule_manager
+% TODO: rewrite directory requests to use index.html (should happen on rule end)
+% TODO: add parameters to rules
+% TODO: examine http methods to find a way to abort a download from examining the headers
 
 -module( crawler ).
 -export( [ start/0, stop/0, router/1, uri_parse/1, html_extract_urls/2, url_makeAbsolute/2 ] ).
 % expose methods for testing
--export( [rule_manager/4, rule_actor/2] ).
+-export( [rule_manager/4, rule_actor/2, find_rule/2, templates_run/2] ).
 
 % start with url on cmd line, maybe some preprocessing
 start() ->
@@ -74,7 +77,7 @@ router(RuleProcesses) ->
 			router( RuleProcesses );
 		{stop} ->
 			lists:map(fun(X) -> element(2, X) ! {stop} end, RuleProcesses),
-			{ok}
+			exit({ok})
 	end.
 
 rule_manager_spawn( [], AccRules ) ->
@@ -120,21 +123,29 @@ rule_actor( {crawl, Name}, Request ) ->
 	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
 	{_, Url, Filenames} = Request,
 	%{Protocol, } = uri_parse( Uri ),
-	Body		 = fetch(Url),
-	RelativeUrls = html_extract_urls(Body, []),
-	Urls		 = lists:map(fun(X) -> url_makeAbsolute(Url, X) end, RelativeUrls),
-	Result 		 = rule_spawn_and_collect( Request, Urls ),
-	ResultString = response_to_string(Result),
-	lists:map(fun(X) -> file:write_file(X, ResultString) end, Filenames),
-	exit(Result);
+	case fetch(Url) of
+		{ok, Body} ->
+			RelativeUrls = html_extract_urls(Body, []),
+			Urls		 = lists:map(fun(X) -> url_makeAbsolute(Url, X) end, RelativeUrls),
+			%io:format( "following urls: ~w~n", [Urls] ),
+			Result 		 = rule_spawn_and_collect( Request, Urls ),
+			ResultString = response_to_string(Result),
+			lists:map(fun(X) -> file:write_file(X, ResultString) end, Filenames),
+			exit(Result);
+		{fail, Reason} ->
+			io:format("fetch failed for ~s with reason: ~w~n", [Url, Reason]),
+			exit({ok, Request, {Url, []}})
+	end;
 rule_actor( {save, Name}, Request ) ->
-	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
 	{_, Url, Filenames} = Request,
-	io:format("save thread '~s:~w' processing ~s~n", [Name, erlang:self(), Url]),
+	io:format("running rule_actor '~s:~w' on url ~s~n", [Name, erlang:self(), Url]),
 	case fetch( Url ) of
 		{ok, Body} ->
-			lists:map(fun(X) -> file:write_file(X, Body) end, Filenames),
-			io:format("rule returning result: ~w~n", [{Request, {Url, Filenames}}]),
+			lists:map(fun(Filename) ->
+				{_, RevDirectory} = partition(47, lists:reverse(Filename)),
+				filelib:ensure_dir(lists:reverse(RevDirectory)),
+				file:write_file(Filename, Body) end, Filenames),
+			io:format("rule returning result: {~s, ~s}~n", [Url, Filenames]),
 			exit({ok, Request, {Url, Filenames}});
 		{fail, Reason} ->
 			io:format("fetch failed for url '~s': ~s~n", [Url, Reason]),
@@ -150,20 +161,23 @@ rule_spawn_and_collect( Request, Urls ) ->
 	PopulatedResponses		= rule_response_collector( Responses, Count ),
 	{ok, Request, PopulatedResponses}.
 rule_spawner( _, [], Responses, Count ) ->
+	io:format( "finished swaping requests, waiting for responses ~w~n", [Responses] ),
 	{ok, Responses, Count};
 rule_spawner( Request, [Url|Urls], Responses, Count ) ->
-	%[{Name, _, OldUrl}|_] = Request,
-	[{Name, _, _}|_] = Request,
+	io:format("rule_spawner: creating request for ~s~n", [Url]),
+	{[{Name, _, _}|_], _, _} = Request,
 	NewId = [{Name, erlang:self(), Url}|Request],
 	% TODO: add in cycling detection for crawlers (examine id for occurrences of the same rule, if exists, spawn thread to resolve)
-	router ! { request, NewId },
+	router ! { request, {NewId, Url} },
 	rule_spawner( Request, Urls, [{Url}|Responses], Count + 1 ).
 rule_response_collector( Responses, 0 ) ->
 	Responses;
 rule_response_collector( Responses, Outstanding ) ->
 %% Collect the result of requests for Urls
+	io:format( "waiting for responses~n" ),
 	receive
 		{ok, Request, Response} ->
+			io:format( "response received ~w~n", [Response] ),
 			{_, Url, _} = Request, 
 			NewResponses = lists:keyreplace(Url, 1, Responses, Response),
 			rule_response_collector( NewResponses, Outstanding - 1 )
@@ -192,7 +206,7 @@ fetch(Url) ->
 			end;
 		Msg ->
 			io:format("failed with '~w'~n", [Msg]),
-			fail
+			{fail, Msg}
 	end.
 
 %process_page( { ok, {_Status, _Headers, Body }} ) ->
@@ -276,6 +290,7 @@ find_rule( [{Translation, PID}|RuleProcesses], Url ) ->
 	{Regex, Atoms, Templates} = Translation,
 	case re:run(Url, Regex, [global, {capture, Atoms, list}]) of
 		{match, Subpatterns} ->
+			io:format("router: matched rule patterns = ~w~natoms = ~w~n", [Subpatterns, Atoms]),
 			{ok, PID, templates_run(lists:zip(Atoms, Subpatterns), Templates)};
 		nomatch ->
 			find_rule( RuleProcesses, Url )

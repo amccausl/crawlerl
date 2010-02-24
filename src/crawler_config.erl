@@ -1,7 +1,7 @@
 -module(crawler_config).
 -export([ load_rules/0 ]).
 
--define(EXTRACT_REGEX, element(2, re:compile("\\?\\<[A-Za-z_0-9]+\\>", [ungreedy]))).
+-define(EXTRACT_REGEX, element(2, re:compile("\\?\\<([A-Za-z_0-9]+)\\>", [ungreedy]))).
 
 load_rules() ->
 	ConfFile = filename:join(["..", "config", "crawler_rules.conf"]),
@@ -19,6 +19,7 @@ trans_compile(Regex, Translations) ->
 	{ok, CompiledRegex} = re:compile(Regex),
 	%CompiledRegex = Regex,
 	CompiledTemplates = lists:map(fun(X) -> erlang:element(2, sgte:compile(X)) end, Translations),
+	io:format("trans_compile: ~s => ~w~n", [Regex, extract_atoms(Regex)]),
 	{CompiledRegex, extract_atoms(Regex), CompiledTemplates}.
 
 extract_atoms(Regex) ->
