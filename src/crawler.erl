@@ -33,6 +33,8 @@
 % TODO: rewrite directory requests to use index.html (should happen on rule end)
 % TODO: add parameters to rules
 % TODO: examine http methods to find a way to abort a download from examining the headers
+% TODO: consider changing methods around to allow $ext$ tag harvested from headers
+% TODO: add parameter for allowed depth, cycling detection or url regex param on crawl rule (use template) 
 
 -module( crawler ).
 -export( [ start/0, stop/0, router/1, uri_parse/1, html_extract_urls/2, url_makeAbsolute/2 ] ).
@@ -139,12 +141,14 @@ rule_actor( {crawl, Name}, Request ) ->
 rule_actor( {save, Name}, Request ) ->
 	{_, Url, Filenames} = Request,
 	io:format("running rule_actor '~s:~w' on url ~s~n", [Name, erlang:self(), Url]),
-	case fetch( Url ) of
-		{ok, Body} ->
+	case fetch_file( Url ) of
+		{ok, FetchedFilename} ->
 			lists:map(fun(Filename) ->
-				{_, RevDirectory} = partition(47, lists:reverse(Filename)),
+				io:format("creating file ~s~n", [Filename]),
+				{_, RevDirectory} = partition($/, lists:reverse(Filename)),
 				filelib:ensure_dir(lists:reverse(RevDirectory)),
-				file:write_file(Filename, Body) end, Filenames),
+				file:copy(FetchedFilename, Filename) end, Filenames),
+			file:delete(FetchedFilename),
 			io:format("rule returning result: {~s, ~s}~n", [Url, Filenames]),
 			exit({ok, Request, {Url, Filenames}});
 		{fail, Reason} ->
@@ -209,6 +213,32 @@ fetch(Url) ->
 			{fail, Msg}
 	end.
 
+fetch_file(Url) ->
+	io:format("fetch: ~s to file~n", [Url]),
+	case ibrowse:send_req(Url, [], get, [], [{save_response_to_file, true}]) of
+		{ok, "200", _, {file, SavedFile}} ->
+		%{ok, "200", Headers, Body} ->
+			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
+			{ok, SavedFile};
+		{ok, "301", Headers, {file, SavedFile}} ->
+			file:delete(SavedFile),
+			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
+			case lists:keyfind("Location", 1, Headers) of
+				false ->
+					io:format("missing Location header on 301 response~n"),
+					{fail, "301 response, no location"};
+				{_, Location} ->
+					io:format("redirecting fetch to ~s~n", [Location]),
+					fetch_file(Location);
+				A ->
+					io:format("match failed for ~w~n", [A]),
+					{fail, "Match failed"}
+			end;
+		Msg ->
+			io:format("failed with '~w'~n", [Msg]),
+			{fail, Msg}
+	end.
+
 %process_page( { ok, {_Status, _Headers, Body }} ) ->
 %	lists:subtract(lists:subtract(Body, "// [ "), "] ");
 %process_page( {error,no_scheme} ) ->
@@ -221,6 +251,7 @@ parse_quoted(Input) ->
 html_extract_urls( [], Urls ) ->
 	lists:reverse(Urls);
 html_extract_urls( HTML, Urls ) ->
+	% TODO: should be case insensitive
 	case lists:prefix("src=", HTML) of
 		true ->
 			{Url, Remaining} = parse_quoted(lists:nthtail(4, HTML)),
@@ -239,23 +270,23 @@ html_extract_urls( HTML, Urls ) ->
 -spec(url_makeAbsolute/2 :: (string(), string()) -> string()).
 url_makeAbsolute( {Protocol, Host, Path, Params}, Link ) ->
 	case hd(Link) of
-		46 ->
+		$. ->
 			% Remove "./" and "../" from urls
-			{First, Second} = partition(47, Link),
+			{First, Second} = partition($/, Link),
 			case First of
 				".." ->
-					{_, NewPath} = partition(47, lists:reverse(Path)),
+					{_, NewPath} = partition($/, lists:reverse(Path)),
 					url_makeAbsolute( {Protocol, Host, lists:reverse(NewPath), Params}, Second );
 				"." ->
 					url_makeAbsolute( {Protocol, Host, Path, Params}, Second );
 				_ ->
 					Protocol ++ "://" ++ Host ++ filename:join(["/", Path, Link])
 			end;
-		47 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Link]); % '/'
-		63 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ Link; % '?'
-		35 -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ "?" ++ Params; % '#'
+		$/ -> Protocol ++ "://" ++ Host ++ filename:join(["/", Link]); % '/'
+		$? -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ Link; % '?'
+		$# -> Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ "?" ++ Params; % '#'
 		_ ->
-			case lists:member(58, Link) of % ':'
+			case lists:member($:, Link) of
 				true ->
 					Link;
 				false ->
@@ -268,9 +299,9 @@ url_makeAbsolute( SourceUrl, Url ) ->
 -spec(uri_parse/1 :: ({string(), string(), string(), string()}) -> string()).
 uri_parse( Uri ) ->
 	% TODO: fix when port is specified, ':'
-	{Protocol, [_|[_|Url]]} = partition(58, Uri),	% Split on ':'
-	{Request, Params} = partition(63, Url),	% Split on '?'
-	{Host, Path} = partition(47, Request),	% Split on '/'
+	{Protocol, [_|[_|Url]]} = partition($:, Uri),
+	{Request, Params} = partition($?, Url),
+	{Host, Path} = partition($/, Request),
 	{string:to_lower(Protocol), Host, Path, Params}.
 
 partition(Delim, Str) ->
@@ -301,6 +332,6 @@ response_to_string(Value) ->
 response_to_string( [], _ ) ->
 	"";
 response_to_string( [{Url, Response}|Rest], Depth ) ->
-	lists:duplicate(Depth, 32) ++ Url ++ "\n" ++ response_to_string( Response, Depth + 2 ) ++ response_to_string(Rest, Depth);
+	lists:duplicate(Depth, $ ) ++ Url ++ "\n" ++ response_to_string( Response, Depth + 2 ) ++ response_to_string(Rest, Depth);
 response_to_string( [Filename|Rest], Depth ) ->
-	lists:duplicate(Depth, 32) ++ Filename ++ "\n" ++ response_to_string( Rest, Depth ).
+	lists:duplicate(Depth, $ ) ++ Filename ++ "\n" ++ response_to_string( Rest, Depth ).
