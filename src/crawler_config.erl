@@ -10,10 +10,10 @@ load_rules() ->
 	CompiledRules = lists:map(fun preprocess/1, Rules),
 	{ok, CompiledRules}.
 
-preprocess({Action, Name, Regex, Translations, _}) ->
-	{Action, Name, trans_compile(Regex, Translations)};
+preprocess({Action, Name, Regex, Translations, Params}) ->
+	{Action, Name, trans_compile(Regex, Translations), Params};
 preprocess({Action, Name, Regex, Translations}) ->
-	{Action, Name, trans_compile(Regex, Translations)}.
+	{Action, Name, trans_compile(Regex, Translations), []}.
 
 trans_compile(Regex, Translations) ->
 	{ok, CompiledRegex} = re:compile(Regex),
