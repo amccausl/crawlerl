@@ -15,7 +15,7 @@
 %% Response 	= {Url, [Filename]}
 %%				= {Url, [Response]}
 %% Params		= [Param]
-%% Param		= {thread, int()} | {url_filter, [UrlFilter]} | {depth, int()} | {header_filter, [HeaderFilter]}
+%% Param		= {thread, int()} | {url_filter, [UrlFilter]} | {depth, int()} | {header_filter, [HeaderFilter]} | {headers, [{header, value}]}
 %% UrlFilter	= {regex, Regex} | {local_only} | {sub_only}
 %% HeaderFilter	= {content_type, string()} | {filesize, {Lower, Upper}}
 
@@ -30,13 +30,16 @@
 %%	Outgoing:	{ok, Request, Response}	=> rule_actor
 
 %% TODO
+% TODO: use log4erl functions instead of io:format
+% TODO: fix rewrite rule bug
+% TODO: determine cause of robot flagging in the wild
 % TODO: add index file handling
 % TODO: should store each processed url in each thread
 % TODO: on launch, should check process cache, then translated filename (if local) to determine if fetch has already occured
 % TODO: add caching in rule_manager
 % TODO: rewrite directory requests to use index.html (should happen on rule end)
 % TODO: add parameter for allowed depth, cycling detection or url regex param on crawl rule (use template) and thread count
-% TODO: add crawl parameters to filter captured urls on regex, header (size, content type)
+% TODO: add crawl parameters to filter captured urls on header (size, content type)
 % TODO: examine http methods to find a way to abort a download from examining the headers
 % TODO: consider changing methods around to allow $ext$ tag harvested from headers
 % TODO: rework to have router populate variables, actor run translation
@@ -50,8 +53,11 @@
 % expose methods for testing
 -export( [ router/1, rule_manager/4, rule_actor/2, find_rule/2, templates_run/2, url_filter/3 ] ).
 
+-define(USER_AGENT, "Mozilla/5.0 (X11; U; Linux i686; en-US) AppleWebKit/533.1 (KHTML, like Gecko) Chrome/5.0.335.0 Safari/533.1").
+ 
 % start with url on cmd line, maybe some preprocessing
 start() ->
+	application:start(log4erl),
 	case lists:member(router, erlang:registered()) of
 		true ->
 			{ok};
@@ -68,7 +74,7 @@ stop() ->
 
 run(Url) ->
 	Timeout = 30,
-	router ! {request, {[{run, erlang:self(), []}], Url}},
+	router ! {request, {[{run, erlang:self(), Url}], Url}},
 	receive
 		{ok, _, Response} ->
 			io:format( "run: response received~n~w~n", [Response] );
@@ -150,17 +156,18 @@ rule_manager( Rule, Queue, Threads, ThreadCount) ->
 
 rule_actor( {crawl, Name, Params}, Request ) ->
 	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
-	{_, URL, {Map, Translations}} = Request,
+	{IDs, URL, {Map, Translations}} = Request,
+	Referer = extract_referer(IDs, URL),
 	Filenames = templates_run(Map, Translations),  
 	UrlFilters = keyfind2( url_filter, 1, Params, [] ),
 	%{Protocol, } = url_to_uri( Uri ),
-	case fetch(URL) of
+	case fetch(URL, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}]) of
 		{ok, Body} ->
 			RelativeUrls = html_extract_urls(Body, []),
 			io:format( "rule_actor: parsed relative urls from '~s'~n~w~n", [URL, RelativeUrls] ),
 			URI			 = url_to_uri( URL ),
 			FullURLs	 = lists:map(fun(X) -> uri_to_url(relativeurl_to_uri(X, URI)) end, RelativeUrls),
-			io:format( "rule_actor: FullURLs = ~w~n", [FullURLs] ),
+			%io:format( "rule_actor: FullURLs = ~w~n", [FullURLs] ),
 			URLs		 = lists:filter(fun(X) -> url_filter( URL, X, UrlFilters ) end, FullURLs ),
 			io:format( "rule_actor: following urls: ~w~n", [URLs] ),
 			Result 		 = rule_spawn_and_collect( Request, URLs ),
@@ -173,16 +180,18 @@ rule_actor( {crawl, Name, Params}, Request ) ->
 			exit({ok, Request, {URL, []}})
 	end;
 rule_actor( {save, Name, Params}, Request ) ->
-	{_, Url, {Map, Translations}} = Request,
-	Filenames = templates_run(Map, Translations),
 	HeaderFilters = keyfind2( header_filter, 1, Params, [] ),
+	{IDs, Url, {Map, Translations}} = Request,
+	Referer = extract_referer(IDs, Url),
+	io:format("rule_actor: extracting referer for ~s from id ~w~n", [Url, IDs]),
+	Filenames = templates_run(Map, Translations),
 	io:format("running rule_actor '~s:~w' on url ~s~n", [Name, erlang:self(), Url]),
-	case fetch_file( Url ) of
+	case fetch_file( Url, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}] ) of
 		{ok, FetchedFilename} ->
+			io:format("fetch: ~s successful~n", [FetchedFilename]),
 			lists:map(fun(Filename) ->
-				%io:format("creating file ~s~n", [Filename]),
-				{_, RevDirectory} = partition($/, lists:reverse(Filename)),
-				filelib:ensure_dir(lists:reverse(RevDirectory)),
+				%io:format("fetch: creating file ~s~n", [Filename]),
+				ok = filelib:ensure_dir(Filename),
 				file:copy(FetchedFilename, Filename) end, Filenames),
 			file:delete(FetchedFilename),
 			io:format("rule returning result: {~s, ~s}~n", [Url, Filenames]),
@@ -191,7 +200,7 @@ rule_actor( {save, Name, Params}, Request ) ->
 			io:format("fetch failed for url '~s': ~w~n", [Url, Reason]),
 			exit({ok, Request, {Url, []}})
 	end;
-rule_actor( {rewrite, Name, Params}, Request ) ->
+rule_actor( {rewrite, Name, _}, Request ) ->
 	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
 	Translations = element(3, Request),
 	exit(rule_spawn_and_collect( Request, Translations )).
@@ -205,6 +214,7 @@ rule_spawner( _, [], Responses, Count ) ->
 	{ok, Responses, Count};
 rule_spawner( Request, [Url|Urls], Responses, Count ) ->
 	io:format("rule_spawner: creating request for '~s'~n", [Url]),
+	timer:sleep(4000),
 	IDs = element(1, Request),
 	NewId = [{rule_spawner, erlang:self(), Url}|IDs],
 	% TODO: add in cycling detection for crawlers (examine id for occurrences of the same rule, if exists, spawn thread to resolve)
@@ -228,9 +238,9 @@ rule_response_collector( Responses, Outstanding ) ->
 	end.
 
 % Crawl helpers
-fetch(Url) ->
+fetch(Url, RequestHeaders) ->
 	io:format("fetching ~s~n", [Url]),
-	case ibrowse:send_req(Url, [], get) of
+	case ibrowse:send_req(Url, RequestHeaders, get) of
 		{ok, "200", _, Body} ->
 		%{ok, "200", Headers, Body} ->
 			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
@@ -243,7 +253,7 @@ fetch(Url) ->
 					{fail, "301 response, no location"};
 				{_, Location} ->
 					io:format("redirecting fetch to ~s~n", [Location]),
-					fetch(Location);
+					fetch(Location, RequestHeaders);
 				A ->
 					io:format("match failed for ~w~n", [A]),
 					{fail, "Match failed"}
@@ -252,11 +262,10 @@ fetch(Url) ->
 			io:format("failed with '~w'~n", [Msg]),
 			{fail, Msg}
 	end.
-fetch_file(Url) ->
+fetch_file(Url, RequestHeaders) ->
 	io:format("fetch: ~s to file~n", [Url]),
-	case ibrowse:send_req(Url, [], get, [], [{save_response_to_file, true}]) of
-		{ok, "200", _, {file, SavedFile}} ->
-		%{ok, "200", Headers, Body} ->
+	case ibrowse:send_req(Url, RequestHeaders, get, [], [{save_response_to_file, true}]) of
+		{ok, "200", Headers, {file, SavedFile}} ->
 			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
 			{ok, SavedFile};
 		{ok, "301", Headers, {file, SavedFile}} ->
@@ -268,7 +277,7 @@ fetch_file(Url) ->
 					{fail, "301 response, no location"};
 				{_, Location} ->
 					io:format("redirecting fetch to ~s~n", [Location]),
-					fetch_file(Location);
+					fetch_file(Location, RequestHeaders);
 				A ->
 					io:format("match failed for ~w~n", [A]),
 					{fail, "Match failed"}
@@ -279,19 +288,25 @@ fetch_file(Url) ->
 	end.
 
 parse_quoted(Input) ->
+	Terminators = "'\" ",
 	[Quote|Tail] = Input,
-	Quoted = lists:takewhile(fun(X) -> X =/= Quote end, Tail),
-	{Quoted, lists:nthtail(length(Quoted), Tail)}.
+	case lists:member(Quote, Terminators) of
+		true ->
+			Quoted = lists:takewhile(fun(X) -> not (lists:member(X, Terminators)) end, Tail),
+			{Quoted, lists:nthtail(length(Quoted), Tail)};
+		false ->
+			Quoted = lists:takewhile(fun(X) -> not (lists:member(X, Terminators)) end, Input),
+			{Quoted, lists:nthtail(length(Quoted), Input)}
+	end.
 html_extract_urls( [], Urls ) ->
 	lists:reverse(Urls);
 html_extract_urls( HTML, Urls ) ->
-	% TODO: should be case insensitive
-	case lists:prefix("src=", HTML) of
+	case lists:prefix("src=", HTML) or lists:prefix("SRC=", HTML) of
 		true ->
 			{Url, Remaining} = parse_quoted(lists:nthtail(4, HTML)),
 			html_extract_urls(Remaining, [Url|Urls]);
 		false ->
-			case lists:prefix("href=", HTML) of
+			case lists:prefix("href=", HTML) or lists:prefix("HREF=", HTML) of
 				true ->
 					{Url, Remaining} = parse_quoted(lists:nthtail(5, HTML)),
 					html_extract_urls(Remaining, [Url|Urls]);
@@ -321,16 +336,25 @@ find_rule( [], _ ) ->
 find_rule( [{Translation, PID}|RuleProcesses], Url ) ->
 	{Regex, Atoms, Templates} = Translation,
 	case re:run(Url, Regex, [global, {capture, Atoms, list}]) of
-		{match, Subpatterns} ->
+		{match, [Subpatterns]} ->
 			%{ok, PID, templates_run(lists:zip(Atoms, Subpatterns), Templates)};
+			io:format( "Atoms = ~w~nSubpatterns = ~w~n", [Atoms, Subpatterns] ),
 			{ok, PID, {lists:zip(Atoms, Subpatterns), Templates}};
 		nomatch ->
 			find_rule( RuleProcesses, Url )
 	end.
+extract_referer([], _) ->
+	"";
+extract_referer([ID|IDs], URL) ->
+	{_, _, Url} = ID,
+	if
+		Url == URL -> extract_referer(IDs, URL);
+		true -> Url
+	end.
 
 %% Apply filters to URLs 
 url_filter( _, DestinationURL, {regex, Regex} ) ->
-	case re:run( uri_to_url(DestinationURL), Regex ) of
+	case re:run( DestinationURL, Regex ) of
 		{match, _} -> true;
 		nomatch -> false
 	end;
@@ -363,6 +387,8 @@ url_to_uri( URL ) ->
 	{Request, Params} = partition($?, Url),
 	{Host, Path} = partition($/, Request),
 	{string:to_lower(Protocol), Host, Path, Params}.
+relativeurl_to_uri( [], URI ) ->
+	URI;
 relativeurl_to_uri( Link, {Protocol, Host, Path, Params} ) ->
 	case hd(Link) of
 		$. ->
@@ -385,7 +411,10 @@ relativeurl_to_uri( Link, {Protocol, Host, Path, Params} ) ->
 				true ->
 					url_to_uri( Link );
 				false ->
-					{Protocol, Host, filename:join(["/", Path, Link]), ""}
+					case partition($/, lists:reverse(Path)) of
+						{"", _} -> {Protocol, Host, filename:join(["/", Path, Link]), ""};
+						{_, PathRev} -> {Protocol, Host, filename:join(["/", lists:reverse(PathRev), Link]), ""}
+					end
 			end
 	end.
 uri_to_url( {Protocol, Host, Path, ""} ) ->
