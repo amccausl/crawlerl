@@ -1,4 +1,10 @@
  %%% @author Alex McCausland <alex.mccausland@gmail.com>
+-module( crawler ).
+-export( [ start/0, stop/0, run/1 ] ).
+% utility methods
+-export( [ url_to_uri/1, uri_to_url/1, html_extract_urls/2 ] ).
+% expose methods for testing
+-export( [ router/1, rule_manager/4, rule_actor/2, find_rule/2, templates_run/2, url_filter/3 ] ).
 
 %% Data Types:
 %%
@@ -19,6 +25,8 @@
 %% UrlFilter	= {regex, Regex} | {local_only} | {sub_only}
 %% HeaderFilter	= {content_type, string()} | {filesize, {Lower, Upper}}
 
+%-record( request, {ids, url, translations} ).
+
 %% Actors:
 %%
 %% router:
@@ -30,7 +38,8 @@
 %%	Outgoing:	{ok, Request, Response}	=> rule_actor
 
 %% TODO
-% TODO: use log4erl functions instead of io:format
+% TODO: rewrite to use records for messages
+% TODO: fix handling of empty url lists
 % TODO: fix rewrite rule bug
 % TODO: determine cause of robot flagging in the wild
 % TODO: add index file handling
@@ -46,18 +55,12 @@
 % TODO: populate variables in translation from fetch (test template if variable is defined multiple times)
 % TODO: look into using as a download handler for uzbl (maybe just as a proxy)
 
--module( crawler ).
--export( [ start/0, stop/0, run/1 ] ).
-% utility methods
--export( [ url_to_uri/1, html_extract_urls/2 ] ).
-% expose methods for testing
--export( [ router/1, rule_manager/4, rule_actor/2, find_rule/2, templates_run/2, url_filter/3 ] ).
-
 -define(USER_AGENT, "Mozilla/5.0 (X11; U; Linux i686; en-US) AppleWebKit/533.1 (KHTML, like Gecko) Chrome/5.0.335.0 Safari/533.1").
  
 % start with url on cmd line, maybe some preprocessing
 start() ->
 	application:start(log4erl),
+	log4erl:conf("../config/log4erl.conf"),
 	case lists:member(router, erlang:registered()) of
 		true ->
 			{ok};
@@ -73,34 +76,33 @@ stop() ->
 	router ! {stop}.
 
 run(Url) ->
-	Timeout = 30,
 	router ! {request, {[{run, erlang:self(), Url}], Url}},
 	receive
 		{ok, _, Response} ->
-			io:format( "run: response received~n~w~n", [Response] );
+			log4erl:info( crawler, "run: response received: ~p", [Response] );
 		Err ->
-			io:format( "run: error ~w~n", [Err] )
-	after Timeout * 1000 ->
-		io:format("run: ~B timeout expired~n", [Timeout])
+			log4erl:error( crawler, "run: error ~p", [Err] )
+	after 30000 ->
+		log4erl:error(crawler, "run: 30 second timeout expired")
 	end.
 
 router(RuleProcesses) ->
-	io:format("router process '~w' waiting...~n", [erlang:self()]),
+	log4erl:debug( crawler, "router process '~p' waiting...", [erlang:self()]),
 % All requests go to the router first
 % The router looks up the rule, runs the translation, generates the Rule request and sends it to the rule manager.
 	receive
 		{request, {Ids, Url}} ->
 			case find_rule( RuleProcesses, Url ) of
 				nomatch ->
-					io:format("router: No rule for url '~s'/n", [Url]),
+					log4erl:info( crawler, lists:concat(["router: No rule for url '", Url, "'"]) ),
 					router(RuleProcesses);
 				{ok, PID, MappedTranslations} ->
-					io:format("router: matched '~s' to rule~n", [Url]),
+					log4erl:info( crawler, lists:concat(["router: matched url '", Url, "' to rule"]) ),
 					PID ! {request, {Ids, Url, MappedTranslations}},
 					router(RuleProcesses)
 			end;
 		{status} ->
-			io:format("router: status~n"),
+			log4erl:info( crawler, "router: status" ),
 			lists:map(fun(X) -> PID = element(2, X), PID ! {status} end, RuleProcesses),
 			router( RuleProcesses );
 		{stop} ->
@@ -117,7 +119,7 @@ rule_manager_spawn( [{Type, Name, Translation, Params}|Rules], AccRules ) ->
 	rule_manager_spawn( Rules, [{Translation, PID}|AccRules] ).
 
 rule_manager( Rule, [Request|Queue], Threads, ThreadCount) when ThreadCount > 0 ->
-	io:format("rule_manager: ~s, with ~B threads left~n", [element(2, Rule), ThreadCount]),
+	log4erl:debug( crawler, "rule_manager: ~s, with ~B threads left", [element(2, Rule), ThreadCount] ),
 	%{Ids, Url, MappedTranslation} = Request,
 	%Id = {element(2, Rule), erlang:self(), Url},
 	%PID = spawn( crawler, rule_actor, [Rule, {[Id|Ids], Url, MappedTranslation}] ),
@@ -126,36 +128,35 @@ rule_manager( Rule, [Request|Queue], Threads, ThreadCount) when ThreadCount > 0 
 	rule_manager( Rule, Queue, [{PID, Request}|Threads], ThreadCount - 1 );
 rule_manager( Rule, Queue, Threads, ThreadCount) ->
 	Name = element(2, Rule),
-	io:format("rule_manager: ~s, waiting with ~B threads left~n", [Name, ThreadCount]),
+	log4erl:debug( crawler, "rule_manager: ~s, waiting with ~B threads left", [Name, ThreadCount] ),
 	receive
 		{request, Request} ->
-			io:format("rule_manager '~s' called with {request, ~s}~n", [Name, request_to_string(Request)]),  
+			log4erl:debug( crawler, "rule_manager '~s' called with {request, ~s}", [Name, request_to_string(Request)] ),  
 			rule_manager( Rule, [Request|Queue], Threads, ThreadCount);
 		{'DOWN', _, process, Pid, Reason} ->
-			io:format("rule_manager '~s': received death from ~w~n", [Name, Pid]),
+			log4erl:debug( crawler, "rule_manager '~s': received death from ~p", [Name, Pid] ),
 			case Reason of
 				{ok, {[], _, _}, Response} ->
-					io:format("Thread '~s:~w' finished~n~w~n", [Name, erlang:self(), Response]);
+					log4erl:debug( crawler, "Thread '~s:~p' finished: ~p", [Name, erlang:self(), Response] );
 				{ok, {[Id|Ids], Url, Translations}, Response} ->
-					% NOTE: Id removed
 					PID = erlang:element(2, Id),
-					io:format("rule_manager ~s: received result from ~w, passing to ~w. id = ~w~n", [Name, Pid, PID, [Id|Ids]]),
+					log4erl:debug( crawler, "rule_manager ~s: received result from ~p, passing to ~p. id = ~p", [Name, Pid, PID, [Id|Ids]] ),
 					PID ! {ok, {Ids, Url, Translations}, Response},
-					io:format("rule_manager ~s: message to ~w: id = ~w~n", [Name, PID, {ok, {Ids, Url, Translations}, Response}]);
+					log4erl:debug( crawler, "rule_manager ~s: message to ~p: id = ~p", [Name, PID, {ok, {Ids, Url, Translations}, Response}] );
 				_ ->
-					io:format("rule_actor '~s:~w' failed: ~w~n", [Name, Pid, Reason])
+					log4erl:error( crawler, "rule_actor '~s:~p' failed: ~p", [Name, Pid, Reason] )
 			end,
 			rule_manager( Rule, Queue, lists:keydelete(Pid, 1, Threads), ThreadCount + 1 );
 		{status} ->
-			io:format("Rule: ~w~n~w~n", [Rule, Threads]),
+			io:format( "Rule: ~p: ~p", [Rule, Threads] ),
 			rule_manager( Rule, Queue, Threads, ThreadCount );
 		{stop} ->
-			io:format("stopping rule_manager '~s:~w' ~B threads~n", [Name, erlang:self(), ThreadCount]),
+			log4erl:info( crawler, "stopping rule_manager '~s:~p' ~B threads", [Name, erlang:self(), ThreadCount] ),
 			lists:map(fun(X) -> exit(element(1, X), kill) end, Threads)
 	end.
 
 rule_actor( {crawl, Name, Params}, Request ) ->
-	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
+	log4erl:debug( crawler, "running rule_actor '~s:~p'", [Name, erlang:self()] ),
 	{IDs, URL, {Map, Translations}} = Request,
 	Referer = extract_referer(IDs, URL),
 	Filenames = templates_run(Map, Translations),  
@@ -163,45 +164,44 @@ rule_actor( {crawl, Name, Params}, Request ) ->
 	%{Protocol, } = url_to_uri( Uri ),
 	case fetch(URL, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}]) of
 		{ok, Body} ->
-			RelativeUrls = html_extract_urls(Body, []),
-			io:format( "rule_actor: parsed relative urls from '~s'~n~w~n", [URL, RelativeUrls] ),
+			RelativeUrls = lists:usort(html_extract_urls(Body, [])),
 			URI			 = url_to_uri( URL ),
-			FullURLs	 = lists:map(fun(X) -> uri_to_url(relativeurl_to_uri(X, URI)) end, RelativeUrls),
-			%io:format( "rule_actor: FullURLs = ~w~n", [FullURLs] ),
+			%log4erl:debug( crawler, "rule_actor: parsed relative urls from '~s' (~p): ~p", [URL, URI, RelativeUrls] ),
+			FullURLs	 = lists:usort(lists:map(fun(X) -> uri_to_url(relativeurl_to_uri(X, URI)) end, RelativeUrls)),
+			%log4erl:debug( crawler, "rule_actor: FullURLs = ~p", [FullURLs] ),
 			URLs		 = lists:filter(fun(X) -> url_filter( URL, X, UrlFilters ) end, FullURLs ),
-			io:format( "rule_actor: following urls: ~w~n", [URLs] ),
+			log4erl:debug( crawler, "rule_actor: following urls: ~p", [URLs] ),
 			Result 		 = rule_spawn_and_collect( Request, URLs ),
-			io:format( "rule_actor '~s:~w': finished crawling urls~n", [Name, erlang:self()] ),
+			log4erl:debug( crawler, "rule_actor '~s:~p': finished crawling urls", [Name, erlang:self()] ),
 			ResultString = response_to_string(element(3, Result)),
 			lists:map(fun(X) -> file:write_file(X, ResultString) end, Filenames),
 			exit(Result);
 		{fail, Reason} ->
-			io:format("fetch failed for ~s with reason: ~w~n", [URL, Reason]),
+			log4erl:error( crawler, "fetch failed for ~s with reason: ~p", [URL, Reason] ),
 			exit({ok, Request, {URL, []}})
 	end;
 rule_actor( {save, Name, Params}, Request ) ->
-	HeaderFilters = keyfind2( header_filter, 1, Params, [] ),
+	_HeaderFilters = keyfind2( header_filter, 1, Params, [] ),
 	{IDs, Url, {Map, Translations}} = Request,
 	Referer = extract_referer(IDs, Url),
-	io:format("rule_actor: extracting referer for ~s from id ~w~n", [Url, IDs]),
+	log4erl:debug( crawler, "rule_actor: extracting referer for ~s from id ~p", [Url, IDs] ),
 	Filenames = templates_run(Map, Translations),
-	io:format("running rule_actor '~s:~w' on url ~s~n", [Name, erlang:self(), Url]),
+	log4erl:info( crawler, "running rule_actor '~s:~p' on url ~s", [Name, erlang:self(), Url] ),
 	case fetch_file( Url, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}] ) of
 		{ok, FetchedFilename} ->
-			io:format("fetch: ~s successful~n", [FetchedFilename]),
+			log4erl:info( crawler, "fetch: ~s successful", [FetchedFilename] ),
 			lists:map(fun(Filename) ->
-				%io:format("fetch: creating file ~s~n", [Filename]),
 				ok = filelib:ensure_dir(Filename),
 				file:copy(FetchedFilename, Filename) end, Filenames),
 			file:delete(FetchedFilename),
-			io:format("rule returning result: {~s, ~s}~n", [Url, Filenames]),
+			log4erl:debug( crawler, "rule returning result: {~s, ~s}", [Url, Filenames] ),
 			exit({ok, Request, {Url, Filenames}});
 		{fail, Reason} ->
-			io:format("fetch failed for url '~s': ~w~n", [Url, Reason]),
+			log4erl:error( crawler, "fetch failed for url '~s': ~p", [Url, Reason] ),
 			exit({ok, Request, {Url, []}})
 	end;
 rule_actor( {rewrite, Name, _}, Request ) ->
-	io:format("running rule_actor '~s:~w'~n", [Name, erlang:self()]),
+	log4erl:debug( crawler, "running rule_actor '~s:~p'", [Name, erlang:self()] ),
 	Translations = element(3, Request),
 	exit(rule_spawn_and_collect( Request, Translations )).
 
@@ -210,10 +210,10 @@ rule_spawn_and_collect( Request, Urls ) ->
 	PopulatedResponses		= rule_response_collector( Responses, Count ),
 	{ok, Request, PopulatedResponses}.
 rule_spawner( _, [], Responses, Count ) ->
-	io:format( "rule_spawner: finished spawning requests, waiting for responses ~w~n", [Responses] ),
+	log4erl:info( crawler, "rule_spawner: finished spawning requests, waiting for responses ~p", [Responses] ),
 	{ok, Responses, Count};
 rule_spawner( Request, [Url|Urls], Responses, Count ) ->
-	io:format("rule_spawner: creating request for '~s'~n", [Url]),
+	log4erl:debug( crawler, "rule_spawner: creating request for '~s'", [Url] ),
 	timer:sleep(4000),
 	IDs = element(1, Request),
 	NewId = [{rule_spawner, erlang:self(), Url}|IDs],
@@ -221,69 +221,51 @@ rule_spawner( Request, [Url|Urls], Responses, Count ) ->
 	router ! { request, {NewId, Url} },
 	rule_spawner( Request, Urls, [{Url}|Responses], Count + 1 ).
 rule_response_collector( Responses, 0 ) ->
-	io:format("rule_response_collector finished~n"),
+	log4erl:info( crawler, "rule_response_collector finished" ),
 	Responses;
 rule_response_collector( Responses, Outstanding ) ->
 %% Collect the result of requests for Urls
-	io:format( "rule_response_collector: waiting for responses (~B outstanding)~n", [Outstanding] ),
+	log4erl:debug( crawler, "rule_response_collector: waiting for responses (~B outstanding)", [Outstanding] ),
 	receive
 		{ok, Request, Response} ->
-			io:format( "rule_response_collector: response received ~w~n", [Response] ),
+			log4erl:debug( crawler, "rule_response_collector: response received ~p", [Response] ),
 			{_, Url, _} = Request, 
 			NewResponses = lists:keyreplace(Url, 1, Responses, Response),
 			rule_response_collector( NewResponses, Outstanding - 1 );
 		Msg ->
-			io:format( "rule_response_collector: error, unknown message ~w~n", [Msg] ),
+			log4erl:error( crawler, "rule_response_collector: error, unknown message ~p", [Msg] ),
 			rule_response_collector( Responses, Outstanding )
 	end.
 
 % Crawl helpers
+fetch_file(Url, RequestHeaders) ->
+	fetch(Url, RequestHeaders, get, [], [{save_response_to_file, true}]).
 fetch(Url, RequestHeaders) ->
-	io:format("fetching ~s~n", [Url]),
-	case ibrowse:send_req(Url, RequestHeaders, get) of
-		{ok, "200", _, Body} ->
-		%{ok, "200", Headers, Body} ->
-			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
+	fetch(Url, RequestHeaders, get, [], []).
+fetch(Url, RequestHeaders, Type, [], Params) ->
+	log4erl:info( crawler, "fetching ~s", [Url] ),
+	case ibrowse:send_req(Url, RequestHeaders, Type, [], Params) of
+		{ok, "200", _Headers, {file, SavedFile}} ->
+			log4erl:debug( crawler, "fetch: headers = ~p", [_Headers] ),
+			{ok, SavedFile};
+		{ok, "200", _Headers, Body} ->
+			log4erl:debug( crawler, "fetch: headers = ~p", [_Headers] ),
 			{ok, Body};
 		{ok, "301", Headers, _} ->
-			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
+			log4erl:debug( crawler, "fetch: redirect headers = ~p", [Headers] ),
 			case lists:keyfind("Location", 1, Headers) of
 				false ->
-					io:format("missing Location header on 301 response~n"),
+					log4erl:error( crawler, "missing Location header on 301 response" ),
 					{fail, "301 response, no location"};
 				{_, Location} ->
-					io:format("redirecting fetch to ~s~n", [Location]),
-					fetch(Location, RequestHeaders);
+					log4erl:warn( crawler, "redirecting fetch to ~s", [Location] ),
+					fetch(Location, RequestHeaders, Type, [], Params);
 				A ->
-					io:format("match failed for ~w~n", [A]),
+					log4erl:error( crawler, "match failed for ~p", [A] ),
 					{fail, "Match failed"}
 			end;
 		Msg ->
-			io:format("failed with '~w'~n", [Msg]),
-			{fail, Msg}
-	end.
-fetch_file(Url, RequestHeaders) ->
-	io:format("fetch: ~s to file~n", [Url]),
-	case ibrowse:send_req(Url, RequestHeaders, get, [], [{save_response_to_file, true}]) of
-		{ok, "200", Headers, {file, SavedFile}} ->
-			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
-			{ok, SavedFile};
-		{ok, "301", Headers, {file, SavedFile}} ->
-			file:delete(SavedFile),
-			%io:format("fetch '~s' => '~w'~n", [Url, Headers]),
-			case lists:keyfind("Location", 1, Headers) of
-				false ->
-					io:format("missing Location header on 301 response~n"),
-					{fail, "301 response, no location"};
-				{_, Location} ->
-					io:format("redirecting fetch to ~s~n", [Location]),
-					fetch_file(Location, RequestHeaders);
-				A ->
-					io:format("match failed for ~w~n", [A]),
-					{fail, "Match failed"}
-			end;
-		Msg ->
-			io:format("failed with '~w'~n", [Msg]),
+			log4erl:error( crawler, "failed with '~p'", [Msg] ),
 			{fail, Msg}
 	end.
 
@@ -329,7 +311,7 @@ partition(Delim, Str) ->
 % Rule helpers
 templates_run( Map, Templates ) ->
 	% Run a list of templates with the variable definitions to return a list of strings
-	%io:format("Rendering templates with map: ~w~n", Map),
+	%io:format("Rendering templates with map: ~p", Map),
 	lists:map(fun(X) -> sgte:render_str(X, Map) end, Templates).
 find_rule( [], _ ) ->
 	nomatch;
@@ -338,7 +320,7 @@ find_rule( [{Translation, PID}|RuleProcesses], Url ) ->
 	case re:run(Url, Regex, [global, {capture, Atoms, list}]) of
 		{match, [Subpatterns]} ->
 			%{ok, PID, templates_run(lists:zip(Atoms, Subpatterns), Templates)};
-			io:format( "Atoms = ~w~nSubpatterns = ~w~n", [Atoms, Subpatterns] ),
+			log4erl:debug( crawler, "Atoms = ~p, Subpatterns = ~p", [Atoms, Subpatterns] ),
 			{ok, PID, {lists:zip(Atoms, Subpatterns), Templates}};
 		nomatch ->
 			find_rule( RuleProcesses, Url )
@@ -367,17 +349,13 @@ url_filter( SourceURL, DestinationURL, {local_only} ) ->
 	{_, DHost, _, _} = url_to_uri(DestinationURL), 
 	SHost == DHost;
 url_filter( SourceURL, DestinationURL, {and_filters, [Filter|Filters]} ) ->
-	case url_filter( SourceURL, DestinationURL, Filter ) of
-		true -> url_filter( SourceURL, DestinationURL, {and_filters, Filters} );
-		false -> false
-	end;
+	url_filter( SourceURL, DestinationURL, Filter )
+		andalso url_filter( SourceURL, DestinationURL, {and_filters, Filters} );
 url_filter( _, _, {and_filters, []} ) ->
 	true;
 url_filter( SourceURL, DestinationURL, [Filter|Filters] ) ->
-	case url_filter( SourceURL, DestinationURL, Filter ) of
-		true -> true;
-		false -> url_filter( SourceURL, DestinationURL, Filters )
-	end;
+	url_filter( SourceURL, DestinationURL, Filter )
+		orelse url_filter( SourceURL, DestinationURL, Filters );
 url_filter( _, _, [] ) ->
 	false.
 
@@ -418,15 +396,15 @@ relativeurl_to_uri( Link, {Protocol, Host, Path, Params} ) ->
 			end
 	end.
 uri_to_url( {Protocol, Host, Path, ""} ) ->
-	Protocol ++ "://" ++ Host ++ Path;
+	Protocol ++ "://" ++ Host ++ filename:join(["/", Path]);
 uri_to_url( {Protocol, Host, Path, Params} ) ->
-	Protocol ++ "://" ++ Host ++ Path ++ "?" ++ Params.
+	Protocol ++ "://" ++ Host ++ filename:join(["/", Path]) ++ "?" ++ Params.
 
 request_to_string({IDs, URL, Translation}) ->
-	Info = lists:flatten(io_lib:format("~s:~w", [URL, Translation])),
+	Info = lists:flatten(io_lib:format("~s:~p", [URL, Translation])),
 	lists:foldl(fun(X, Acc) -> lists:append([id_to_string(X), " => ", Acc]) end, Info, IDs).
 id_to_string( {RuleName, PID, URL} ) ->
-	lists:flatten(io_lib:format("'~s:~w' ~s", [RuleName, PID, URL])).
+	lists:flatten(io_lib:format("'~s:~p' ~s", [RuleName, PID, URL])).
 response_to_string(Value) ->
 	response_to_string( Value, 0 ).
 response_to_string( [], _ ) ->
@@ -436,5 +414,5 @@ response_to_string( [{Url, Response}|Rest], Depth ) ->
 response_to_string( [Filename|Rest], Depth ) ->
 	lists:duplicate(Depth, $ ) ++ Filename ++ "\n" ++ response_to_string( Rest, Depth );
 response_to_string( Response, _ ) ->
-	io:format("response_to_string: unknown response ~w~n", [Response]),
+	log4erl:error(crawler, "response_to_string: unknown response ~p", [Response]),
 	"".
