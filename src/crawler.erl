@@ -38,6 +38,8 @@
 %%	Outgoing:	{ok, Request, Response}	=> rule_actor
 
 %% TODO
+% TODO: clean up logging
+% TODO: use same format for index files that feh supports
 % TODO: rewrite to use records for messages
 % TODO: fix handling of empty url lists
 % TODO: fix rewrite rule bug
@@ -61,6 +63,9 @@
 start() ->
 	application:start(log4erl),
 	log4erl:conf("../config/log4erl.conf"),
+	ibrowse:start(),
+	% TODO: configure http client
+	ets:new(cookie_jar, [duplicate_bag, public, named_table]),
 	case lists:member(router, erlang:registered()) of
 		true ->
 			{ok};
@@ -68,9 +73,7 @@ start() ->
 			{ok, Rules} = crawler_config:load_rules(),
 			RuleProcesses = rule_manager_spawn( Rules, [] ),
 			PID = spawn( crawler, router, [RuleProcesses] ),
-			register(router, PID),
-			% TODO: configure http client
-			ibrowse:start()
+			register(router, PID)
 	end.
 stop() ->
 	router ! {stop}.
@@ -82,7 +85,7 @@ run(Url) ->
 			log4erl:info( crawler, "run: response received: ~p", [Response] );
 		Err ->
 			log4erl:error( crawler, "run: error ~p", [Err] )
-	after 30000 ->
+	after infinity ->
 		log4erl:error(crawler, "run: 30 second timeout expired")
 	end.
 
@@ -94,10 +97,10 @@ router(RuleProcesses) ->
 		{request, {Ids, Url}} ->
 			case find_rule( RuleProcesses, Url ) of
 				nomatch ->
-					log4erl:info( crawler, lists:concat(["router: No rule for url '", Url, "'"]) ),
+					log4erl:warn( crawler, "router: No rule for url '~s'", [Url] ),
 					router(RuleProcesses);
 				{ok, PID, MappedTranslations} ->
-					log4erl:info( crawler, lists:concat(["router: matched url '", Url, "' to rule"]) ),
+					log4erl:info( crawler, "router: matched url '~s' to rule", [Url] ),
 					PID ! {request, {Ids, Url, MappedTranslations}},
 					router(RuleProcesses)
 			end;
@@ -115,15 +118,15 @@ rule_manager_spawn( [], AccRules ) ->
 rule_manager_spawn( [{Type, Name, Translation}|Rules], AccRules ) ->
 	rule_manager_spawn( [{Type, Name, Translation, []}|Rules], AccRules );
 rule_manager_spawn( [{Type, Name, Translation, Params}|Rules], AccRules ) ->
-	PID = spawn( crawler, rule_manager, [{Type, Name, Params}, [], [], 5]),
+	Threads = keyfind(threads, 2, Params, 5),
+	PID = spawn( crawler, rule_manager, [{Type, Name, Params}, [], [], Threads]),
 	rule_manager_spawn( Rules, [{Translation, PID}|AccRules] ).
 
-rule_manager( Rule, [Request|Queue], Threads, ThreadCount) when ThreadCount > 0 ->
+rule_manager( {Type, Name, Params} = Rule, [{IDs, URL, _} = Request|Queue], Threads, ThreadCount) when ThreadCount > 0 ->
 	log4erl:debug( crawler, "rule_manager: ~s, with ~B threads left", [element(2, Rule), ThreadCount] ),
-	%{Ids, Url, MappedTranslation} = Request,
-	%Id = {element(2, Rule), erlang:self(), Url},
-	%PID = spawn( crawler, rule_actor, [Rule, {[Id|Ids], Url, MappedTranslation}] ),
-	PID = spawn( crawler, rule_actor, [Rule, Request] ),
+	log4erl:debug( crawler, "rule_manager: extracting referer for ~s from id ~p", [URL, IDs] ),
+	RequestHeaders = get_cookies(URL, [{'REFERER', extract_referer(IDs, URL)}, {'USER_AGENT', ?USER_AGENT}]), 
+	PID = spawn( crawler, rule_actor, [{Type, Name, [{headers, RequestHeaders}|Params]}, Request] ),
 	erlang:monitor(process, PID),
 	rule_manager( Rule, Queue, [{PID, Request}|Threads], ThreadCount - 1 );
 rule_manager( Rule, Queue, Threads, ThreadCount) ->
@@ -140,9 +143,9 @@ rule_manager( Rule, Queue, Threads, ThreadCount) ->
 					log4erl:debug( crawler, "Thread '~s:~p' finished: ~p", [Name, erlang:self(), Response] );
 				{ok, {[Id|Ids], Url, Translations}, Response} ->
 					PID = erlang:element(2, Id),
-					log4erl:debug( crawler, "rule_manager ~s: received result from ~p, passing to ~p. id = ~p", [Name, Pid, PID, [Id|Ids]] ),
+					log4erl:debug( crawler, "rule_manager ~s: received result from ~p, passing to ~p.", [Name, Pid, PID] ),
 					PID ! {ok, {Ids, Url, Translations}, Response},
-					log4erl:debug( crawler, "rule_manager ~s: message to ~p: id = ~p", [Name, PID, {ok, {Ids, Url, Translations}, Response}] );
+					log4erl:debug( crawler, "rule_manager ~s: message to ~p: id = ~s", [Name, PID, lists:foldl(fun(X, Acc) -> lists:append([id_to_string(X), " => ", Acc]) end, "", Ids)] );
 				_ ->
 					log4erl:error( crawler, "rule_actor '~s:~p' failed: ~p", [Name, Pid, Reason] )
 			end,
@@ -157,13 +160,11 @@ rule_manager( Rule, Queue, Threads, ThreadCount) ->
 
 rule_actor( {crawl, Name, Params}, Request ) ->
 	log4erl:debug( crawler, "running rule_actor '~s:~p'", [Name, erlang:self()] ),
-	{IDs, URL, {Map, Translations}} = Request,
-	Referer = extract_referer(IDs, URL),
-	Filenames = templates_run(Map, Translations),  
-	UrlFilters = keyfind2( url_filter, 1, Params, [] ),
-	%{Protocol, } = url_to_uri( Uri ),
-	case fetch(URL, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}]) of
-		{ok, Body} ->
+	{_, URL, {Map, Translations}} = Request,
+	RequestHeaders = keyfind( headers, 2, Params, [] ),
+	UrlFilters = keyfind( url_filter, 2, Params, [] ),
+	case fetch(URL, RequestHeaders) of
+		{ok, Headers, Body} ->
 			RelativeUrls = lists:usort(html_extract_urls(Body, [])),
 			URI			 = url_to_uri( URL ),
 			%log4erl:debug( crawler, "rule_actor: parsed relative urls from '~s' (~p): ~p", [URL, URI, RelativeUrls] ),
@@ -174,6 +175,7 @@ rule_actor( {crawl, Name, Params}, Request ) ->
 			Result 		 = rule_spawn_and_collect( Request, URLs ),
 			log4erl:debug( crawler, "rule_actor '~s:~p': finished crawling urls", [Name, erlang:self()] ),
 			ResultString = response_to_string(element(3, Result)),
+			Filenames = templates_run(Map, Translations),
 			lists:map(fun(X) -> file:write_file(X, ResultString) end, Filenames),
 			exit(Result);
 		{fail, Reason} ->
@@ -181,15 +183,15 @@ rule_actor( {crawl, Name, Params}, Request ) ->
 			exit({ok, Request, {URL, []}})
 	end;
 rule_actor( {save, Name, Params}, Request ) ->
-	_HeaderFilters = keyfind2( header_filter, 1, Params, [] ),
-	{IDs, Url, {Map, Translations}} = Request,
-	Referer = extract_referer(IDs, Url),
-	log4erl:debug( crawler, "rule_actor: extracting referer for ~s from id ~p", [Url, IDs] ),
-	Filenames = templates_run(Map, Translations),
+	_HeaderFilters = keyfind( header_filter, 2, Params, [] ),
+	{_, Url, {Map, Translations}} = Request,
+	RequestHeaders = keyfind( headers, 2, Params, [] ),
 	log4erl:info( crawler, "running rule_actor '~s:~p' on url ~s", [Name, erlang:self(), Url] ),
-	case fetch_file( Url, [{"REFERER", Referer}, {"USER_AGENT", ?USER_AGENT}] ) of
-		{ok, FetchedFilename} ->
+	case fetch_file( Url, RequestHeaders ) of
+		{ok, Headers, FetchedFilename} ->
 			log4erl:info( crawler, "fetch: ~s successful", [FetchedFilename] ),
+			%TODO: add header to map 
+			Filenames = templates_run(Map, Translations),
 			lists:map(fun(Filename) ->
 				ok = filelib:ensure_dir(Filename),
 				file:copy(FetchedFilename, Filename) end, Filenames),
@@ -244,13 +246,15 @@ fetch(Url, RequestHeaders) ->
 	fetch(Url, RequestHeaders, get, [], []).
 fetch(Url, RequestHeaders, Type, [], Params) ->
 	log4erl:info( crawler, "fetching ~s", [Url] ),
-	case ibrowse:send_req(Url, RequestHeaders, Type, [], Params) of
-		{ok, "200", _Headers, {file, SavedFile}} ->
-			log4erl:debug( crawler, "fetch: headers = ~p", [_Headers] ),
-			{ok, SavedFile};
-		{ok, "200", _Headers, Body} ->
-			log4erl:debug( crawler, "fetch: headers = ~p", [_Headers] ),
-			{ok, Body};
+	case ibrowse:send_req(Url, get_cookies(Url, RequestHeaders), Type, [], Params) of
+		{ok, "200", Headers, {file, SavedFile}} ->
+			set_cookie(url_to_uri(Url), Headers),
+			log4erl:debug( crawler, "fetch: headers = ~p", [Headers] ),
+			{ok, Headers, SavedFile};
+		{ok, "200", Headers, Body} ->
+			set_cookie(url_to_uri(Url), Headers),
+			log4erl:debug( crawler, "fetch: headers = ~p", [Headers] ),
+			{ok, Headers, Body};
 		{ok, "301", Headers, _} ->
 			log4erl:debug( crawler, "fetch: redirect headers = ~p", [Headers] ),
 			case lists:keyfind("Location", 1, Headers) of
@@ -269,6 +273,42 @@ fetch(Url, RequestHeaders, Type, [], Params) ->
 			{fail, Msg}
 	end.
 
+set_cookie(_, []) ->
+	true;
+set_cookie({_, Host, _, _} = URI, [{"Set-Cookie", CookieRequest}|Headers]) ->
+	log4erl:info( crawler, "request from '~s', saving cookie: ~s", [Host, CookieRequest] ),
+	{Cookie, _Path} = partition( $ , CookieRequest ),
+	ets:insert(cookie_jar, {Host, Cookie}),
+	set_cookie(URI, Headers);
+set_cookie(URI, [_|Headers]) ->
+	set_cookie(URI, Headers).
+get_cookies(URL, RequestHeaders) ->
+	log4erl:info( crawler, "retrieving cookies for ~s", [URL] ),
+	{_Protocol, Host, _Path, _Params} = url_to_uri( URL ),
+	case ets:lookup(cookie_jar, Host) of
+		false ->
+			RequestHeaders;
+		Cookies ->
+			CookieMap = lists:foldl(
+				fun(X, Acc) ->
+						{Key, Value} = partition($=, element(2, X)),
+						lists:keystore(Key, 1, Acc, {Key, Value})
+					end,
+				[], Cookies),
+			CookieStr = lists:foldl(
+				fun({Key, Value}, Acc) ->
+						lists:concat([Key, "=", Value, " ", Acc]) end, "", CookieMap),
+			log4erl:debug( crawler, "using cookies: ~s", [CookieStr] ),
+			[{cookie, CookieStr}|RequestHeaders]
+	end.
+extract_referer([], _) ->
+	"";
+extract_referer([ID|IDs], URL) ->
+	{_, _, Url} = ID,
+	if
+		Url == URL -> extract_referer(IDs, URL);
+		true -> Url
+	end.
 parse_quoted(Input) ->
 	Terminators = "'\" ",
 	[Quote|Tail] = Input,
@@ -297,10 +337,10 @@ html_extract_urls( HTML, Urls ) ->
 					html_extract_urls(T, Urls)
 			end
 	end.
-keyfind2(Key, N, TupleList, Default) ->
-	case lists:keyfind(Key, N, TupleList) of
-		{Key, Value} -> Value;
-		false -> Default
+keyfind(Key, N, TupleList, Default) ->
+	case lists:keyfind(Key, 1, TupleList) of
+		false -> Default;
+		Tuple -> element(N, Tuple)
 	end.
 partition(Delim, Str) ->
 	{Str1, Str2} = lists:splitwith(fun(A) -> A =/= Delim end, Str),
@@ -324,14 +364,6 @@ find_rule( [{Translation, PID}|RuleProcesses], Url ) ->
 			{ok, PID, {lists:zip(Atoms, Subpatterns), Templates}};
 		nomatch ->
 			find_rule( RuleProcesses, Url )
-	end.
-extract_referer([], _) ->
-	"";
-extract_referer([ID|IDs], URL) ->
-	{_, _, Url} = ID,
-	if
-		Url == URL -> extract_referer(IDs, URL);
-		true -> Url
 	end.
 
 %% Apply filters to URLs 
